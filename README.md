@@ -137,16 +137,15 @@ locally (see [Building locally](#building-locally)).
 same distribution model upstream uses for its own pod VM images.
 
 ```bash
-# Resolve the tag once, so you verify the same image you pull:
-digest=$(oras resolve ghcr.io/unique-ag/aws-sandbox-kata-podvm:nightly)
-
-# Build provenance (SLSA) and the SBOM (CycloneDX), both from the registry:
-gh attestation verify "oci://ghcr.io/unique-ag/aws-sandbox-kata-podvm@${digest}" --owner unique-ag
-gh attestation verify "oci://ghcr.io/unique-ag/aws-sandbox-kata-podvm@${digest}" --owner unique-ag \
-  --predicate-type https://cyclonedx.org/bom
-
-oras pull "ghcr.io/unique-ag/aws-sandbox-kata-podvm@${digest}"
-tar -I zstd -xf podvm.tar.zst
+# Verify build provenance (SLSA) and the SBOM (CycloneDX) for one digest, and
+# pull and unpack that digest only if both pass. The checks read GitHub's
+# attestation API; add --bundle-from-oci to read the copies in the registry.
+digest=$(oras resolve ghcr.io/unique-ag/aws-sandbox-kata-podvm:nightly) &&
+  gh attestation verify "oci://ghcr.io/unique-ag/aws-sandbox-kata-podvm@${digest}" --owner unique-ag &&
+  gh attestation verify "oci://ghcr.io/unique-ag/aws-sandbox-kata-podvm@${digest}" --owner unique-ag \
+    --predicate-type https://cyclonedx.org/bom &&
+  oras pull "ghcr.io/unique-ag/aws-sandbox-kata-podvm@${digest}" &&
+  tar -I zstd -xf podvm.tar.zst
 ```
 
 A run artifact would not do: it expires after 14 days and is addressable only
