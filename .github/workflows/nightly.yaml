@@ -1,0 +1,263 @@
+# Nightly pod VM image build.
+#
+# The cloud-api-adaptor ref is pinned, so what moves between runs is the Ubuntu
+# package set the image is built from — which is the point: a nightly rebuild
+# picks up distribution security fixes. The AMI is NOT registered here; see
+# "Promotion to an AMI" in the README. Nightly produces an attested artifact,
+# nothing more.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      caa_ref:
+        description: "cloud-api-adaptor ref to build (default: the pinned version)"
+        required: false
+        type: string
+      scratch_no_integrity:
+        description: "Experiment: format the scratch disk without dm-integrity. Never claims the nightly tag."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One build at a time: they are long and disk-hungry, and a queued run picking
+# up the same package set tells us nothing new.
+concurrency:
+  group: podvm-build
+  cancel-in-progress: false
+
+env:
+  ORAS_VERSION: "1.3.4"
+  ORAS_SHA256: "f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454"
+  TRIVY_VERSION: "0.74.0"
+  TRIVY_SHA256: "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+  YQ_VERSION: "v4.54.1"
+  YQ_SHA256: "8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f"
+  # Ahead of the CAA ref's own pin, which leaves fixable HIGH stdlib findings
+  # that the scan below gates on. Raise it when upstream's pin passes the gate.
+  GO_VERSION: "1.26.10"
+  # Upstream already carries this on main; it is only the tagged release that
+  # lags. Drop it once a release ships x/net >= 0.62.0 (CVE-2026-78661).
+  GO_MOD_BUMP: "golang.org/x/net@v0.62.0"
+
+jobs:
+  build:
+    name: 🔐 Build, scan and attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write # attest-build-provenance
+      attestations: write # attest-build-provenance
+      packages: write # publish the image to ghcr
+      security-events: write # SARIF upload
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Reclaim disk space
+        # mkosi pulls a build container and writes a multi-GB image; the
+        # runner's default free space is not enough for both.
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null
+          df -h /
+
+          # mkosi fails deep in the build on a full disk, with an error that
+          # says nothing about space. Check it where the message can be clear.
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "available: ${avail}G"
+          if (( avail < 20 )); then
+            echo "::error::Only ${avail}G free; the mkosi build needs roughly 20G for the builder image, the rootfs and the output."
+            exit 1
+          fi
+
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-utils uidmap
+          # mikefarah yq 4.x specifically: the build script reads the pinned
+          # mkosi version with it, and python-yq would quote the scalar.
+          curl -fsSL -o yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  yq" | sha256sum -c -
+          sudo install -m 0755 yq /usr/local/bin/yq
+
+      - name: Install trivy
+        run: |
+          set -euo pipefail
+          curl -fsSL -o trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -
+          tar -xzf trivy.tar.gz trivy
+          sudo install -m 0755 trivy /usr/local/bin/trivy
+
+      - name: Build the pod VM image
+        run: |
+          set -euo pipefail
+          # Upstream's provenance check cannot discover the attestation: GHCR's
+          # referrers API 404s and oras does not fall back to the tag scheme,
+          # where the sigstore bundle is in fact present. Re-enable when it can.
+          ./scripts/build-podvm-image.sh --out build --no-verify-provenance \
+            --go-version "$GO_VERSION" --go-mod-bump "$GO_MOD_BUMP" \
+            ${CAA_REF:+--ref "$CAA_REF"} \
+            ${SCRATCH_NO_INTEGRITY:+--scratch-no-integrity}
+        env:
+          CAA_REF: ${{ inputs.caa_ref }}
+          SCRATCH_NO_INTEGRITY: ${{ inputs.scratch_no_integrity && '1' || '' }}
+
+      - name: Locate the image
+        id: image
+        run: |
+          set -euo pipefail
+          raw=$(ls build/podvm-*.raw)
+          {
+            echo "path=${raw}"
+            echo "name=$(basename "${raw}")"
+            echo "sarif=${raw}.sarif"
+            echo "sbom=${raw}.cdx.json"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Scan the image
+        id: scan
+        # Keeps going on findings so the SARIF still reaches code scanning and
+        # the artifact is still available to triage; the job fails at the end.
+        continue-on-error: true
+        # Through env, not interpolated into the command line: the value is
+        # ours, but the habit is what keeps an injected one from running.
+        env:
+          IMAGE_PATH: ${{ steps.image.outputs.path }}
+        run: sudo ./scripts/scan-image.sh --image "$IMAGE_PATH"
+
+      - name: Upload SARIF
+        # The gate is in scan-image.sh, so a failed upload must not fail it.
+        continue-on-error: true
+        if: ${{ hashFiles(format('{0}', steps.image.outputs.sarif)) != '' }}
+        uses: github/codeql-action/upload-sarif@d208ec71e39ae46397cbf6569bef8439b9aab974 # codeql-bundle-v2.27.2
+        with:
+          sarif_file: ${{ steps.image.outputs.sarif }}
+          category: podvm-image
+
+      - name: Publish the image to ghcr
+        # A run artifact expires in 14 days and is addressable only by run id.
+        # The registry gives it a digest, a date tag and a life beyond that,
+        # which is what promotion needs to refer to.
+        id: publish
+        if: ${{ steps.scan.outcome == 'success' }}
+        env:
+          IMAGE_PATH: ${{ steps.image.outputs.path }}
+          # Through env, never interpolated into the shell: a secret expanded
+          # inline lands in the process list and any trace output.
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+          CAA_REF: ${{ inputs.caa_ref }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o oras.tar.gz \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          echo "${ORAS_SHA256}  oras.tar.gz" | sha256sum -c -
+          tar -xzf oras.tar.gz oras
+          sudo install -m 0755 oras /usr/local/bin/oras
+
+          # -10, not -19: a disk image is already mostly incompressible and the
+          # top levels cost minutes per run for a few percent.
+          cd build
+          image=$(basename "$IMAGE_PATH")
+          tar -I 'zstd -10 -T0' -cf podvm.tar.zst "$image"
+
+          printf '%s' "$GHCR_TOKEN" | oras login ghcr.io -u "$GHCR_USER" --password-stdin
+
+          # OCI repository names are lowercase; github.repository keeps the
+          # organisation's capitals, which the registry rejects outright.
+          repo="ghcr.io/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+
+          # The build records what it actually built; carry it to the registry
+          # so promotion can read it without the expiring run artifact.
+          prov="${image}.provenance"
+          caa_ref=$(sed -n 's/^caa_ref=//p' "$prov")
+          caa_commit=$(sed -n 's/^caa_commit=//p' "$prov")
+          pinned=$(sed -n 's/^PINNED_REF="\(.*\)"$/\1/p' ../scripts/build-podvm-image.sh)
+
+          scratch_ni=$(sed -n 's/^scratch_no_integrity=//p' "$prov")
+
+          # Only an unmodified build of the pinned ref may claim the tags
+          # promotion pulls. A dispatch of some other ref, or one carrying the
+          # scratch patch, gets its own tag and cannot displace it.
+          if [[ "${scratch_ni}" == "yes" ]]; then
+            tags="experiment-scratch-no-integrity-${REVISION:0:7}"
+            echo "::warning::Built with --scratch-no-integrity — publishing as ${tags} only"
+          elif [[ -z "${CAA_REF}" || "${CAA_REF}" == "${pinned}" ]]; then
+            tags="nightly-$(date -u +%Y%m%d),nightly"
+          else
+            safe_ref=$(printf '%s' "$caa_ref" | tr -c 'a-zA-Z0-9._-' '-')
+            tags="dispatch-${safe_ref}-${REVISION:0:7}"
+            echo "::warning::Built ${caa_ref}, not the pinned ${pinned} — publishing as ${tags} only"
+          fi
+
+          oras push --format json \
+            --annotation "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
+            --annotation "org.opencontainers.image.revision=${REVISION}" \
+            --annotation "dev.unique.podvm.caa-ref=${caa_ref}" \
+            --annotation "dev.unique.podvm.caa-commit=${caa_commit}" \
+            "${repo}:${tags}" \
+            podvm.tar.zst:application/vnd.oci.image.layer.v1.tar+zstd \
+            "${prov}:text/plain" > push.json
+
+          digest=$(jq -r '.digest' push.json)
+          {
+            echo "repo=${repo}"
+            echo "digest=${digest}"
+            echo "tags=${tags}"
+          } >> "$GITHUB_OUTPUT"
+          echo "published ${repo}:${tags}@${digest} (${caa_ref} @ ${caa_commit})"
+
+      - name: Attest the SBOM
+        # Ships the component list with the image so a consumer can answer
+        # "what is in this?" without mounting it.
+        if: ${{ steps.scan.outcome == 'success' }}
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.publish.outputs.repo }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          sbom-path: ${{ steps.image.outputs.sbom }}
+          push-to-registry: true
+
+      - name: Attest build provenance
+        # Only a build that passed its scan gets an attestation: promotion
+        # trusts the attestation, so it must not bless an image we rejected.
+        if: ${{ steps.scan.outcome == 'success' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.publish.outputs.repo }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      # The rejected image is deliberately not uploaded: in a public repository
+      # any signed-in user can download a run artifact. Triage by building the
+      # same commit locally.
+      - name: Upload the records
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: podvm-${{ github.run_id }}
+          path: |
+            build/podvm-*.raw.provenance
+            build/podvm-*.raw.sarif
+            build/podvm-*.raw.cdx.json
+          retention-days: 14
+
+      - name: Fail if the scan found something
+        if: ${{ steps.scan.outcome != 'success' }}
+        run: |
+          echo "::error::The image did not pass its vulnerability scan. Findings are in the Security tab and in this run's podvm-${GITHUB_RUN_ID} records; the image itself is not kept."
+          exit 1

@@ -1,0 +1,10 @@
+# Findings accepted for the gate, with an expiry date.
+#
+# These are NOT hidden: the scan still reports them in full, so they stay in the
+# SARIF and in code scanning. Only the pass/fail gate skips them, and only until
+# the date given. After that they gate again, so an acceptance cannot be
+# forgotten. Format: <CVE-ID> <YYYY-MM-DD>.
+#
+# Nothing is accepted at present. CVE-2026-78669 was listed here until the build
+# started raising golang.org/x/net to 0.60.0, which clears it outright; an
+# acceptance that is no longer needed is removed rather than left to expire.
