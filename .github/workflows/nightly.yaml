@@ -161,6 +161,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REVISION: ${{ github.sha }}
           CAA_REF: ${{ inputs.caa_ref }}
+          DEFAULT_REF: refs/heads/${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           curl -fsSL -o oras.tar.gz \
@@ -190,12 +191,17 @@ jobs:
 
           scratch_ni=$(sed -n 's/^scratch_no_integrity=//p' "$prov")
 
-          # Only an unmodified build of the pinned ref may claim the tags
-          # promotion pulls. A dispatch of some other ref, or one carrying the
-          # scratch patch, gets its own tag and cannot displace it.
+          # Only an unmodified build of the pinned ref, from the default branch,
+          # may claim the tags promotion pulls. A dispatch from another branch,
+          # of some other ref, or one carrying the scratch patch, gets its own
+          # tag and cannot displace it.
           if [[ "${scratch_ni}" == "yes" ]]; then
             tags="experiment-scratch-no-integrity-${REVISION:0:7}"
             echo "::warning::Built with --scratch-no-integrity — publishing as ${tags} only"
+          elif [[ "${GITHUB_REF}" != "${DEFAULT_REF}" ]]; then
+            safe_branch=$(printf '%s' "${GITHUB_REF#refs/heads/}" | tr -c 'a-zA-Z0-9._-' '-' | cut -c1-60)
+            tags="branch-${safe_branch}-${REVISION:0:7}"
+            echo "::warning::Built from ${GITHUB_REF}, not ${DEFAULT_REF} — publishing as ${tags} only"
           elif [[ -z "${CAA_REF}" || "${CAA_REF}" == "${pinned}" ]]; then
             tags="nightly-$(date -u +%Y%m%d),nightly"
           else

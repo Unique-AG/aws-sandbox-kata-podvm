@@ -75,8 +75,11 @@ jobs:
           curl -fsSL -o zizmor.tar.gz \
             "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
           echo "${ZIZMOR_SHA256}  zizmor.tar.gz" | sha256sum -c -
-          tar -xzf zizmor.tar.gz
-          sudo install -m 0755 "$(find . -name zizmor -type f | head -1)" /usr/local/bin/zizmor
+          # Extracted on its own, so a file named zizmor in the checkout can't be
+          # picked up in place of the verified release binary.
+          zizmor_dir="$(mktemp -d)"
+          tar -xzf zizmor.tar.gz -C "${zizmor_dir}"
+          sudo install -m 0755 "$(find "${zizmor_dir}" -name zizmor -type f | head -1)" /usr/local/bin/zizmor
           zizmor --version
       - name: Audit the workflows
         # Catches the failure modes that matter for a repository whose product
@@ -96,8 +99,9 @@ jobs:
 
       - uses: github/codeql-action/upload-sarif@d208ec71e39ae46397cbf6569bef8439b9aab974 # codeql-bundle-v2.27.2
         # A fork PR gets a read-only token whatever `permissions:` says, so the
-        # upload would 403 and fail the job for every outside contributor.
-        if: ${{ !cancelled() && github.event.pull_request.head.repo.full_name == github.repository }}
+        # upload would 403 and fail the job for every outside contributor. Pushes
+        # to main upload too, so code scanning has default-branch results.
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
         with:
           sarif_file: zizmor.sarif
           category: zizmor

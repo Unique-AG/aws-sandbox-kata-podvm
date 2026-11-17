@@ -178,6 +178,7 @@ if os.path.exists(path):
             accept[parts[0]] = datetime.date.fromisoformat(parts[1])
         except (IndexError, ValueError):
             # A malformed entry must not silently widen the gate.
+            print(f"malformed entry in {path}: {line!r} (want <CVE-ID> <YYYY-MM-DD>)", file=sys.stderr)
             print(0, 0, 0, 0, 0, 1)
             sys.exit(0)
 
@@ -205,10 +206,10 @@ PY
 
 echo ""
 info "SARIF:   ${SARIF_OUT}"
-components=$(python3 -I -c "
-import json,sys
-print(len(json.load(open('${SBOM_OUT}')).get('components') or []))
-" 2>/dev/null || echo '?')
+components=$(python3 -I -c '
+import json, sys
+print(len(json.load(open(sys.argv[1])).get("components") or []))
+' "$SBOM_OUT") || error "Could not read the SBOM at ${SBOM_OUT}"
 info "SBOM:    ${SBOM_OUT} (${components} components)"
 info "Findings: ${total} vulnerabilities total, ${gated} gating at ${SEVERITY}, ${secrets} secrets"
 if ((unfixed > 0)); then

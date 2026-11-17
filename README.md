@@ -118,7 +118,8 @@ warning that the build still works — not a continuously patched image. Each ru
    vulnerabilities and secrets.
 3. Publishes the image to `ghcr.io/unique-ag/aws-sandbox-kata-podvm` as an OCI
    artifact — **only if the scan passed** — tagged `nightly-YYYYMMDD` and
-   `nightly`.
+   `nightly`. A manual run from another branch, of another CAA ref or with the
+   scratch patch gets its own tag and cannot move `nightly`.
 4. Attests build provenance and the SBOM against the **published digest**, with
    `push-to-registry`, so both resolve from the registry.
 5. Keeps the SARIF, SBOM and `.provenance` record as a run artifact for triage.
@@ -136,11 +137,16 @@ locally (see [Building locally](#building-locally)).
 same distribution model upstream uses for its own pod VM images.
 
 ```bash
-oras pull ghcr.io/unique-ag/aws-sandbox-kata-podvm:nightly
-tar -I zstd -xf podvm.tar.zst
+# Resolve the tag once, so you verify the same image you pull:
+digest=$(oras resolve ghcr.io/unique-ag/aws-sandbox-kata-podvm:nightly)
 
-# Provenance and SBOM resolve from the registry, by digest:
-gh attestation verify oci://ghcr.io/unique-ag/aws-sandbox-kata-podvm:nightly --owner unique-ag
+# Build provenance (SLSA) and the SBOM (CycloneDX), both from the registry:
+gh attestation verify "oci://ghcr.io/unique-ag/aws-sandbox-kata-podvm@${digest}" --owner unique-ag
+gh attestation verify "oci://ghcr.io/unique-ag/aws-sandbox-kata-podvm@${digest}" --owner unique-ag \
+  --predicate-type https://cyclonedx.org/bom
+
+oras pull "ghcr.io/unique-ag/aws-sandbox-kata-podvm@${digest}"
+tar -I zstd -xf podvm.tar.zst
 ```
 
 A run artifact would not do: it expires after 14 days and is addressable only
