@@ -1,0 +1,6 @@
+# Build output — images are artifacts, never committed.
+build/
+*.raw
+*.qcow2
+*.provenance
+*.sarif

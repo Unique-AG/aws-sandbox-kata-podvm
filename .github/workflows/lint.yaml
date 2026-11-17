@@ -1,0 +1,107 @@
+# Static analysis of what this repository actually is: shell scripts and the
+# workflows that run them. The image is scanned in nightly.yaml.
+name: "[sec] Lint and audit"
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Superseded revisions are cancelled: these jobs only read, so losing one
+# costs nothing and a stale run gates nothing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check every tracked shell script
+        # -x follows `source`, so the shared helpers are analysed in context
+        # rather than reported as unresolvable.
+        run: |
+          set -euo pipefail
+          mapfile -t scripts < <(git ls-files '*.sh')
+          printf 'checking %d script(s)\n' "${#scripts[@]}"
+          shellcheck --external-sources --severity=warning "${scripts[@]}"
+
+  workflows:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+      - run: actionlint -color
+
+  audit:
+    name: zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload the zizmor SARIF to code scanning
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install zizmor
+        env:
+          ZIZMOR_VERSION: "1.30.1"
+          # zizmor publishes no checksums file; this hash was taken from the
+          # released artifact. It detects later tampering, not a bad original.
+          ZIZMOR_SHA256: "e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZIZMOR_SHA256}  zizmor.tar.gz" | sha256sum -c -
+          # Extracted on its own, so a file named zizmor in the checkout can't be
+          # picked up in place of the verified release binary.
+          zizmor_dir="$(mktemp -d)"
+          tar -xzf zizmor.tar.gz -C "${zizmor_dir}"
+          sudo install -m 0755 "$(find "${zizmor_dir}" -name zizmor -type f | head -1)" /usr/local/bin/zizmor
+          zizmor --version
+      - name: Audit the workflows
+        # Catches the failure modes that matter for a repository whose product
+        # is a build pipeline: template injection, over-broad permissions,
+        # unpinned actions, cache poisoning.
+        #
+        # Twice, deliberately: `--format sarif` exits 0 even with findings, so
+        # it can upload but cannot gate. The gating run is the one that counts.
+        env:
+          # Without a token zizmor runs offline and silently skips the online
+          # audits, such as known-vulnerable-actions.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          zizmor --format sarif --persona regular . > zizmor.sarif
+          zizmor --format github --persona regular .
+
+      - uses: github/codeql-action/upload-sarif@d208ec71e39ae46397cbf6569bef8439b9aab974 # codeql-bundle-v2.27.2
+        # A fork PR gets a read-only token whatever `permissions:` says, so the
+        # upload would 403 and fail the job for every outside contributor. Pushes
+        # to main upload too, so code scanning has default-branch results.
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
