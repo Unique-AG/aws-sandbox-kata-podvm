@@ -4,12 +4,15 @@
 #######################################
 #
 # Builds the Confidential Containers pod VM disk image from source with mkosi,
-# pinned to the CAA version the peerpods chart vendors, and prints the SHA256
-# of the result for import-podvm-ami.sh to verify.
+# pinned to the CAA version the peerpods chart vendors. Writes
+# podvm-<ref>-<arch>[-debug].raw, prints its SHA256 for hello-aws's
+# import-podvm-ami.sh to verify, and records the build inputs in a .provenance
+# file next to the image.
 #
-# Runs the upstream build unmodified — this only pins the version, checks the
-# host, and reports what came out. Requires Linux with Docker; the mkosi build
-# needs a privileged container and cannot run on macOS.
+# Runs upstream's build. Two opt-in options change the source first, and the
+# .provenance file records both: --go-mod-bump and --scratch-no-integrity.
+# Requires Linux with Docker; the mkosi build needs a privileged container and
+# cannot run on macOS.
 #
 # Usage:
 #   ./build-podvm-image.sh [options]
@@ -20,6 +23,8 @@
 #       --debug-image     Build upstream's debug variant instead
 #       --go-version VER  Build with this Go toolchain instead of the pinned one
 #       --go-mod-bump M@V Raise one Go module before building (repeatable)
+#       --go-image IMG    Go image for --go-mod-bump, required with it, as
+#                         golang:<build's Go version>@sha256:<digest>
 #       --scratch-no-integrity
 #                         Format the pod VM scratch disk without dm-integrity
 #       --no-verify-provenance
@@ -63,6 +68,8 @@ GO_VERSION=""
 # Modules raised in the CAA source before building, as module@version. For
 # clearing a CVE upstream has already fixed on main but not yet released.
 GO_MOD_BUMPS=()
+# The image the bumps run in, pinned by digest; no default, so a tag never decides.
+GO_IMAGE=""
 # setup-scratch-storage passes four arguments, but luks-encrypt-storage reads
 # data_integrity from the fifth, so it defaults to true and the scratch disk is
 # formatted --integrity-no-wipe. Reads of unwritten sectors then fail with
@@ -78,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --no-verify-provenance) VERIFY_PROVENANCE="no"; shift ;;
     --go-version)   need_value "$@"; GO_VERSION="$2"; shift 2 ;;
     --go-mod-bump)  need_value "$@"; GO_MOD_BUMPS+=("$2"); shift 2 ;;
+    --go-image)     need_value "$@"; GO_IMAGE="$2"; shift 2 ;;
     --scratch-no-integrity) SCRATCH_NO_INTEGRITY="yes"; shift ;;
     --check)        CHECK_ONLY=true; shift ;;
     -h|--help)      print_help "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -163,18 +171,19 @@ PODVM_DIR="${SRC_DIR}/src/cloud-api-adaptor/podvm"
 # Build
 #######################################
 
-# Applied in a container of the same Go toolchain, so the host needs no Go and
-# Recorded in the provenance file: the one place the source stops being
-# upstream's exactly.
+# Run in a container of the build's own Go toolchain, so the host needs no Go;
+# the bumps are recorded in the provenance file.
 if ((${#GO_MOD_BUMPS[@]})); then
   # Mount all of src/, not just cloud-api-adaptor: its go.mod replaces sibling
   # modules with ../ paths, which do not resolve from a narrower mount.
   CAA_SRC="${SRC_DIR}/src"
-  GO_IMAGE="golang:${GO_VERSION:-$(yq -e '.tools.golang' "${CAA_SRC}/cloud-api-adaptor/versions.yaml")}"
-  # Tags are mutable, so resolve once and run the digest for every step below.
+  GO_WANT="${GO_VERSION:-$(yq -e '.tools.golang' "${CAA_SRC}/cloud-api-adaptor/versions.yaml")}"
+  GO_IMAGE_RE='^[^@]+:([^@:/]+)@sha256:[0-9a-f]{64}$'
+  [[ "$GO_IMAGE" =~ $GO_IMAGE_RE ]] \
+    || error "--go-mod-bump needs --go-image golang:${GO_WANT}@sha256:<digest>, got '${GO_IMAGE}'"
+  [[ "${BASH_REMATCH[1]}" == "$GO_WANT" ]] \
+    || error "--go-image is Go ${BASH_REMATCH[1]}, but this build uses Go ${GO_WANT}"
   docker pull --quiet "$GO_IMAGE" >/dev/null || error "Could not pull ${GO_IMAGE}"
-  GO_IMAGE=$(docker image inspect "$GO_IMAGE" --format '{{index .RepoDigests 0}}') \
-    || error "Could not resolve a digest for ${GO_IMAGE}"
   info "Go toolchain ${GO_IMAGE}"
   for bump in "${GO_MOD_BUMPS[@]}"; do
     [[ "$bump" == *@* ]] || error "--go-mod-bump expects module@version, got '${bump}'"

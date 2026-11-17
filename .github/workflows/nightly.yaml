@@ -41,6 +41,8 @@ env:
   # Ahead of the CAA ref's own pin, which leaves fixable HIGH stdlib findings
   # that the scan below gates on. Raise it when upstream's pin passes the gate.
   GO_VERSION: "1.26.10"
+  # The toolchain GO_MOD_BUMP runs in, pinned by digest; its tag must match GO_VERSION.
+  GO_IMAGE: "golang:1.26.10@sha256:cfa27959837144bf4649802ba38e59daffd0dd2a7994aa83daaf113285b0f551"
   # Upstream already carries this on main; it is only the tagged release that
   # lags. Drop it once a release ships x/net >= 0.62.0 (CVE-2026-78661).
   GO_MOD_BUMP: "golang.org/x/net@v0.62.0"
@@ -107,7 +109,7 @@ jobs:
           # referrers API 404s and oras does not fall back to the tag scheme,
           # where the sigstore bundle is in fact present. Re-enable when it can.
           ./scripts/build-podvm-image.sh --out build --no-verify-provenance \
-            --go-version "$GO_VERSION" --go-mod-bump "$GO_MOD_BUMP" \
+            --go-version "$GO_VERSION" --go-image "$GO_IMAGE" --go-mod-bump "$GO_MOD_BUMP" \
             ${CAA_REF:+--ref "$CAA_REF"} \
             ${SCRATCH_NO_INTEGRITY:+--scratch-no-integrity}
         env:
